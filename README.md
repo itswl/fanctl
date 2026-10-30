@@ -45,10 +45,22 @@ sudo brew services start fanctl
 
 Homebrew builds it in a second and runs it as a root service, also at every boot. The config is
 `$(brew --prefix)/etc/fancontrol.conf` (the balanced preset) and the log
-`$(brew --prefix)/var/log/fancontrol.log`; every fanctl command works the same. Upgrade with
-`brew upgrade fanctl && sudo brew services restart fanctl`, uninstall with
-`sudo brew services stop fanctl && brew uninstall fanctl`. Use either Homebrew or the one-line
-installer, not both.
+`$(brew --prefix)/var/log/fancontrol.log`; every fanctl command works the same. Use either
+Homebrew or the one-line installer, not both.
+
+A root service's files are made root-owned by `brew services`, so hand them back to yourself before
+Homebrew changes them:
+
+```sh
+# upgrade
+sudo chown -R "$(whoami)" "$(brew --cellar fanctl)"
+brew upgrade fanctl && sudo brew services restart fanctl
+
+# uninstall
+sudo brew services stop fanctl
+sudo chown -R "$(whoami)" "$(brew --cellar fanctl)"
+brew uninstall fanctl
+```
 
 ## Presets
 

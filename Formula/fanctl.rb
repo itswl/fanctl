@@ -27,6 +27,8 @@ class Fanctl < Formula
       fanctl drives the fans from a root service. Start it, also at every boot, with:
         sudo brew services start fanctl
       Use either Homebrew or the one-line installer from the README, not both.
+      brew services makes the files root-owned; before brew upgrade/uninstall run:
+        sudo chown -R "$(whoami)" "$(brew --cellar fanctl)"
     EOS
   end
 

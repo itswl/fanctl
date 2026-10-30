@@ -44,9 +44,22 @@ sudo brew services start fanctl
 
 Homebrew 一秒编译好，以 root 服务运行，开机也会自动启动。配置在
 `$(brew --prefix)/etc/fancontrol.conf`（balanced 预设），日志在
-`$(brew --prefix)/var/log/fancontrol.log`；所有 fanctl 命令用法不变。升级：
-`brew upgrade fanctl && sudo brew services restart fanctl`；卸载：
-`sudo brew services stop fanctl && brew uninstall fanctl`。Homebrew 和一行安装二选一，不要同时用。
+`$(brew --prefix)/var/log/fancontrol.log`；所有 fanctl 命令用法不变。Homebrew 和一行安装二选一，
+不要同时用。
+
+以 root 运行的服务，`brew services` 会把它的文件改成 root 所有，所以 Homebrew 改动它之前要先把所有权
+拿回来：
+
+```sh
+# 升级
+sudo chown -R "$(whoami)" "$(brew --cellar fanctl)"
+brew upgrade fanctl && sudo brew services restart fanctl
+
+# 卸载
+sudo brew services stop fanctl
+sudo chown -R "$(whoami)" "$(brew --cellar fanctl)"
+brew uninstall fanctl
+```
 
 ## 预设
 
