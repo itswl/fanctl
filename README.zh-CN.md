@@ -37,6 +37,7 @@ curl -fsSL https://github.com/itswl/fanctl/releases/latest/download/install.sh |
 
 ```sh
 brew tap itswl/fanctl https://github.com/itswl/fanctl
+brew trust --formula itswl/fanctl/fanctl    # Homebrew 7 及以上需要，执行一次
 brew install fanctl
 sudo brew services start fanctl
 ```

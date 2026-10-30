@@ -38,6 +38,7 @@ the log). The fans go back to macOS.
 
 ```sh
 brew tap itswl/fanctl https://github.com/itswl/fanctl
+brew trust --formula itswl/fanctl/fanctl    # Homebrew 7 and later ask for this once
 brew install fanctl
 sudo brew services start fanctl
 ```
