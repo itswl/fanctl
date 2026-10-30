@@ -3,6 +3,7 @@ class Fanctl < Formula
   homepage "https://github.com/itswl/fanctl"
   url "https://github.com/itswl/fanctl/archive/refs/tags/v1.0.3.tar.gz"
   sha256 "80e83440042f25e5144562febb872e5fa55c5fbbea9cf77731e3f3ebe63a1a29"
+  revision 1
 
   depends_on arch: :arm64
   depends_on macos: :sonoma
@@ -13,7 +14,7 @@ class Fanctl < Formula
            "-DCONF_PATH=\"#{etc}/fancontrol.conf\"",
            "-DPRESET_DIR=\"#{opt_pkgshare}/presets\"",
            "-DLOG_PATH=\"#{var}/log/fancontrol.log\"",
-           "-DLABEL=\"homebrew.mxcl.fanctl\"",
+           "-DLABEL=\"#{plist_name}\"",
            "-DSETUP_HINT=\"set it up with: sudo brew services start fanctl\""
     bin.install "fanctl"
     cp "presets/balanced.conf", "fancontrol.conf"
