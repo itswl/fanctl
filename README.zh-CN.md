@@ -33,6 +33,20 @@ curl -fsSL https://github.com/itswl/fanctl/releases/latest/download/install.sh |
 卸载：`sudo /usr/local/share/fanctl/uninstall.sh`（加 `--purge` 连配置和日志一起删），
 风扇交回 macOS。
 
+### Homebrew
+
+```sh
+brew tap itswl/fanctl https://github.com/itswl/fanctl
+brew install fanctl
+sudo brew services start fanctl
+```
+
+Homebrew 一秒编译好，以 root 服务运行，开机也会自动启动。配置在
+`$(brew --prefix)/etc/fancontrol.conf`（balanced 预设），日志在
+`$(brew --prefix)/var/log/fancontrol.log`；所有 fanctl 命令用法不变。升级：
+`brew upgrade fanctl && sudo brew services restart fanctl`；卸载：
+`sudo brew services stop fanctl && brew uninstall fanctl`。Homebrew 和一行安装二选一，不要同时用。
+
 ## 预设
 
 | 预设 | 接管温度 | 适合 |
@@ -75,7 +89,7 @@ sudo fanctl start         # 恢复按曲线控制
 
 ## 配置
 
-`/usr/local/etc/fancontrol.conf`：
+`/usr/local/etc/fancontrol.conf`（Homebrew：`$(brew --prefix)/etc/fancontrol.conf`）：
 
 ```
 interval 3            # fanctl 接管风扇时，每隔几秒检查一次

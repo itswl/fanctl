@@ -34,6 +34,21 @@ curl -fsSL https://github.com/itswl/fanctl/releases/latest/download/install.sh |
 Uninstall with `sudo /usr/local/share/fanctl/uninstall.sh` (`--purge` also deletes the config and
 the log). The fans go back to macOS.
 
+### Homebrew
+
+```sh
+brew tap itswl/fanctl https://github.com/itswl/fanctl
+brew install fanctl
+sudo brew services start fanctl
+```
+
+Homebrew builds it in a second and runs it as a root service, also at every boot. The config is
+`$(brew --prefix)/etc/fancontrol.conf` (the balanced preset) and the log
+`$(brew --prefix)/var/log/fancontrol.log`; every fanctl command works the same. Upgrade with
+`brew upgrade fanctl && sudo brew services restart fanctl`, uninstall with
+`sudo brew services stop fanctl && brew uninstall fanctl`. Use either Homebrew or the one-line
+installer, not both.
+
 ## Presets
 
 | Preset | Takes over at | For |
@@ -77,7 +92,7 @@ sudo fanctl start         # back to the curve
 
 ## Configuration
 
-`/usr/local/etc/fancontrol.conf`:
+`/usr/local/etc/fancontrol.conf` (Homebrew: `$(brew --prefix)/etc/fancontrol.conf`):
 
 ```
 interval 3            # seconds between checks while fanctl drives the fans

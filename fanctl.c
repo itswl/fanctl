@@ -49,11 +49,25 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 
-#define FANCTL_VERSION "1.0.2"
+#define FANCTL_VERSION "1.0.3"
+
+/* Install locations. The Homebrew formula builds with its own (see Formula/fanctl.rb). */
+#ifndef CONF_PATH
 #define CONF_PATH      "/usr/local/etc/fancontrol.conf"
+#endif
+#ifndef PRESET_DIR
 #define PRESET_DIR     "/usr/local/share/fanctl/presets"
+#endif
+#ifndef LOG_PATH
+#define LOG_PATH       "/var/log/fancontrol.log"
+#endif
+#ifndef SETUP_HINT
+#define SETUP_HINT     "install fanctl with the one-line command in the README"
+#endif
 #define LOCK_PATH      "/var/run/fanctl.lock"
+#ifndef LABEL
 #define LABEL          "local.fancontrol"
+#endif
 #define PLIST_PATH     "/Library/LaunchDaemons/" LABEL ".plist"
 #define MAX_FANS       8
 
@@ -64,7 +78,7 @@
 
 /* ------------------------------------------------------------------ log */
 
-/* One write per line, timestamped (launchd sends stderr to /var/log/fancontrol.log). */
+/* One write per line, timestamped (launchd sends stderr to the log file). */
 static void logmsg(const char *fmt, ...)
 {
     char line[512];
@@ -908,7 +922,7 @@ static int cmd_autostart(int argc, char **argv)
     if (!on && !off) { fprintf(stderr, "usage: fanctl autostart [on|off]\n"); return 2; }
     if (geteuid() != 0) { fprintf(stderr, "fanctl: autostart needs root: sudo fanctl autostart %s\n", argv[0]); return 1; }
     if (on && access(PLIST_PATH, R_OK) != 0) {
-        fprintf(stderr, "fanctl: %s is missing; install fanctl with the one-line command in the README\n", PLIST_PATH);
+        fprintf(stderr, "fanctl: %s is missing; " SETUP_HINT "\n", PLIST_PATH);
         return 1;
     }
     launchctl(on ? "enable" : "disable", "system/" LABEL, NULL);
@@ -922,7 +936,7 @@ static int cmd_start(void)
 {
     if (need_root("start") != 0) return 1;
     if (access(PLIST_PATH, R_OK) != 0) {
-        fprintf(stderr, "fanctl: %s is missing; install fanctl with the one-line command in the README\n", PLIST_PATH);
+        fprintf(stderr, "fanctl: %s is missing; " SETUP_HINT "\n", PLIST_PATH);
         return 1;
     }
     Config c;
@@ -939,7 +953,7 @@ static int cmd_start(void)
     if (was_off) launchctl("disable", "system/" LABEL, NULL);
     if (i == 5) { fprintf(stderr, "fanctl: launchctl bootstrap failed\n"); return 1; }
     for (int i = 0; daemon_pid() == 0; i++) {
-        if (i == 40) { fprintf(stderr, "fanctl: the daemon did not start; see /var/log/fancontrol.log\n"); return 1; }
+        if (i == 40) { fprintf(stderr, "fanctl: the daemon did not start; see " LOG_PATH "\n"); return 1; }
         usleep(250000);
     }
     print_daemon_line();
