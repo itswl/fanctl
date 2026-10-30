@@ -182,6 +182,9 @@ Resident memory is about 3 MB.
 ### Other details
 
 - If the temperature cannot be read three times in a row, the fans go back to macOS.
+- Sleep: fanctl never holds off sleep or hibernation. Before the Mac sleeps it hands the fans back
+  to macOS, so a sleeping Mac's fans behave as without fanctl; after waking it starts over, and
+  macOS keeps the fans until a takeover is confirmed again.
 - No signal handlers (IOKit is not async-signal-safe): TERM/INT/HUP are collected through kqueue
   and handled in the main loop. TERM hands the fans back before exiting, HUP reloads the config.
 - The LaunchDaemon uses `ProcessType` `Standard` (utility QoS, priority 20). With every core busy,

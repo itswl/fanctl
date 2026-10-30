@@ -171,6 +171,8 @@ Apple Silicon 的 HID 里没有 CPU 核心传感器，Intel 时代的 SMC 键（
 ### 其他细节
 
 - 连续 3 次读不到温度，风扇交回 macOS。
+- 睡眠：fanctl 不会阻止或推迟睡眠、休眠。Mac 睡眠前它先把风扇交回 macOS，睡着时的风扇和没装
+  fanctl 一样；醒来后从头开始，macOS 继续管风扇，直到再次确认需要接管。
 - 不装信号处理函数（IOKit 不是 async-signal-safe）：TERM/INT/HUP 通过 kqueue 收，在主循环里处理。
   TERM 先把风扇交回再退出，HUP 重新加载配置。
 - LaunchDaemon 的 `ProcessType` 用 `Standard`（utility QoS，优先级 20）。全核满载时 sleep 500 ms，

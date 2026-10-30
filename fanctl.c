@@ -43,10 +43,13 @@
 #include <sys/stat.h>
 #include <spawn.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#include <mach/mach.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 
-#define FANCTL_VERSION "1.0"
+#define FANCTL_VERSION "1.0.1"
 #define CONF_PATH      "/usr/local/etc/fancontrol.conf"
 #define PRESET_DIR     "/usr/local/share/fanctl/presets"
 #define LOCK_PATH      "/var/run/fanctl.lock"
@@ -1013,16 +1016,66 @@ static int signals_init(void)
     return 0;
 }
 
-/* Waits sec seconds or until a signal arrives. */
+/* Sleep and wake. fanctl never holds sleep off: before the Mac sleeps it hands the fans back to
+ * the SMC, so a sleeping Mac's fans behave exactly as without fanctl, and only then lets it sleep;
+ * after waking it starts over from SMC control. The notifications arrive on a Mach port that sits
+ * in the same kqueue as the signals, so they are handled on the main thread between ticks. */
+static io_connect_t pm_root = MACH_PORT_NULL;
+static IONotificationPortRef pm_port = NULL;
+static mach_port_t pm_set = MACH_PORT_NULL;
+static int fans_ours = 0;           /* mirrors the main loop's "manual" for the sleep handler */
+static int run_dry = 0;
+static int power_event = 0;         /* slept or woke: the main loop starts over */
+
+static void on_power(void *ref, io_service_t svc, natural_t type, void *arg)
+{
+    (void)ref;
+    (void)svc;
+    if (type == kIOMessageCanSystemSleep) {
+        IOAllowPowerChange(pm_root, (intptr_t)arg);         /* never veto idle sleep */
+    } else if (type == kIOMessageSystemWillSleep || type == kIOMessageSystemHasPoweredOn) {
+        int had = fans_ours, still = 0;
+        if (had && !run_dry) still = restore_auto();        /* also on a wake we did not see coming */
+        fans_ours = 0;
+        power_event = 1;
+        if (type == kIOMessageSystemWillSleep) {
+            IOAllowPowerChange(pm_root, (intptr_t)arg);
+            logmsg("going to sleep%s", !had ? "" : still ? ": could not hand every fan back to SMC" : ": fans back to SMC");
+        } else {
+            logmsg("woke up: the SMC has the fans until a takeover is confirmed again");
+        }
+    }
+}
+
+static int power_init(void)
+{
+    io_object_t notifier;
+    pm_root = IORegisterForSystemPower(NULL, &pm_port, on_power, &notifier);
+    if (pm_root == MACH_PORT_NULL) return -1;
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &pm_set) != KERN_SUCCESS ||
+        mach_port_insert_member(mach_task_self(), IONotificationPortGetMachPort(pm_port), pm_set) != KERN_SUCCESS)
+        return -1;
+    struct kevent ev;
+    EV_SET(&ev, pm_set, EVFILT_MACHPORT, EV_ADD, 0, 0, NULL);
+    return kevent(sig_kq, &ev, 1, NULL, 0, NULL) < 0 ? -1 : 0;
+}
+
+/* Waits sec seconds, or until a signal or a sleep/wake notification arrives. */
 static void wait_tick(int sec)
 {
     struct timespec ts = { sec, 0 };
     struct kevent ev;
     int n = kevent(sig_kq, NULL, 0, &ev, 1, &ts);
     if (n < 0) { sleep(sec); return; }          /* should not happen; never spin */
-    if (n > 0) {
-        if (ev.ident == SIGHUP) reload_req = 1;
-        else stop_sig = (int)ev.ident;
+    if (n == 0) return;
+    if (ev.filter == EVFILT_MACHPORT) {
+        union { mach_msg_header_t h; char buf[4096]; } m;
+        if (mach_msg(&m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof m, pm_set, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS)
+            IODispatchCalloutFromMessage(NULL, &m.h, pm_port);
+    } else if (ev.ident == SIGHUP) {
+        reload_req = 1;
+    } else {
+        stop_sig = (int)ev.ident;
     }
 }
 
@@ -1071,6 +1124,8 @@ static int cmd_run(int argc, char **argv)
     if (t < 0) { logmsg("no temperature sensors (not an Apple Silicon Mac?), exiting"); return 1; }
     if (!dry && take_lock() < 0) return 1;
     if (signals_init() != 0) { logmsg("kqueue: %s", strerror(errno)); return 1; }
+    run_dry = dry;
+    if (power_init() != 0) logmsg("cannot watch for sleep; the fans will not be handed back before it");
 
     if (!dry) restore_auto();           /* start from SMC control; take over when it gets warm */
     char d[200];
@@ -1090,6 +1145,11 @@ static int cmd_run(int argc, char **argv)
     time_t last_write = 0, last_fail_log = 0;
 
     while (!stop_sig) {
+        if (power_event) {              /* slept or woke: the fans are the SMC's again, start over */
+            power_event = 0;
+            manual = 0;
+            up_n = down_n = 0;
+        }
         if (reload_req) {               /* sudo launchctl kill HUP system/local.fancontrol */
             reload_req = 0;
             Config nc;
@@ -1111,7 +1171,7 @@ static int cmd_run(int argc, char **argv)
                 /* Never sit on manual mode blind: after 3 failed reads the SMC gets the fans. */
                 if (++bad_temp == 1) logmsg("cannot read the temperature");
                 if (manual && bad_temp >= 3) {
-                    manual = 0;
+                    manual = fans_ours = 0;
                     up_n = down_n = 0;
                     if (!dry) restore_auto();
                     logmsg("no temperature for %d reads -> fans back to SMC", bad_temp);
@@ -1142,7 +1202,7 @@ static int cmd_run(int argc, char **argv)
                 continue;
             }
             /* Start from wherever the SMC has the fans, so taking over is not a jump. */
-            manual = 1;
+            manual = fans_ours = 1;
             k = 0;
             up_n = down_n = 0;
             cpu_ema = -1;
@@ -1161,7 +1221,7 @@ static int cmd_run(int argc, char **argv)
             /* Hand back only after confirm_down checks in a row below auto_below - hysteresis. */
             down_n = t < cfg.auto_below - cfg.auto_hyst ? down_n + 1 : 0;
             if (down_n >= cfg.confirm_down) {
-                manual = 0;
+                manual = fans_ours = 0;
                 up_n = down_n = 0;
                 int still = dry ? 0 : restore_auto();
                 if (still) logmsg("PMU %.1f°C -> fans back to SMC, but %d still read as manual", t, still);
