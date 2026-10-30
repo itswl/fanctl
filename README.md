@@ -85,7 +85,7 @@ auto_below 55         # below this PMU temperature macOS keeps the fans (they ma
 auto_hysteresis 5     # hand back only below 55 - 5 = 50 °C, so it does not flap
 confirm_up 5          # a rise must show on 5 checks in a row before fanctl reacts (default)
 confirm_down 20       # a fall must show on 20 checks in a row (default)
-cpu_guard 90 100      # CPU guard, this is the default; "cpu_guard off" disables it
+cpu_guard 95 108      # CPU guard, this is the default; "cpu_guard off" disables it
 
 curve_pct 50 1        # <°C> <percent of each fan's range: 0 = minimum, 100 = maximum>
 curve_pct 60 13       # linear in between, flat beyond the ends
@@ -100,7 +100,8 @@ curve_pct 70 35
 - `cpu_guard <start> <full>`: while fanctl drives the fans and the smoothed CPU temperature is
   above `<start>`, the fans run at least at (temperature − start) / (full − start) of their range,
   100 % at `<full>`. Without it, the slow PMU temperature would keep the fans low during long
-  full loads.
+  full loads. CPU hot spots sit at 95–103 °C under ordinary sustained load, so the default starts at
+  95 °C.
 - Keep `auto_below` above the idle temperature, or the fans never stop (`lap` does this on purpose).
 - After editing, run `sudo fanctl reload`. It checks the file first; an invalid file is rejected
   and the old config stays in effect.
@@ -119,8 +120,10 @@ move gradually:
 | Slower fans | `confirm_down` checks wanting less (default 20, about 1 min) | ramps down by 0.5 % per second (about 3 min back) |
 | Handing back | `confirm_down` checks below `auto_below - auto_hysteresis` | macOS takes over from the current speed |
 
-While a takeover is being confirmed macOS keeps cooling as usual. The one exception: when the
-smoothed CPU temperature reaches the `cpu_guard` full point, the fans go to full speed at once.
+While a takeover is being confirmed macOS keeps cooling as usual. Two things skip the confirmation
+and hand the fans straight back to macOS, keeping fanctl out for two minutes: the smoothed CPU
+temperature reaching 110 °C (the chip's limit; macOS then throttles as well as cooling), and CPU
+sensors that cannot be read for three checks.
 
 ### Temperatures
 
@@ -141,7 +144,8 @@ otherwise it reads every `Tp*`/`Te*`/`Tg*` key.
 | `F<i>Ac` | actual speed |
 | `F<i>Mn` / `F<i>Mx` | speed range |
 | `F<i>Tg` | target speed (`flt`) |
-| `F<i>Md` | mode (`ui8`): **1 = manual, 0 = SMC** |
+| `F<i>Md` (`F<i>md` on newer chips) | mode (`ui8`): **1 = manual, 0 = SMC**, 3 = macOS is managing the temperature |
+| `Ftst` | one switch for all fans; only some MacBooks have it |
 
 Easy to get wrong:
 
@@ -152,8 +156,11 @@ Easy to get wrong:
 4. Without root the SMC also reports success and does nothing, so every write is read back.
 5. The SMC throttles rapid writes. fanctl writes only when the target moves by more than 100 rpm,
    writes all fans in one batch and leaves at least 2 s between batches.
-6. If the system takes a fan back (`F<i>Md` reads 0) or its target changes underneath, fanctl
+6. If the system takes a fan back (the mode reads 0 or 3) or its target changes underneath, fanctl
    takes it over again on the next check.
+7. Some MacBooks refuse manual mode (mode 3) until `Ftst` is 1. fanctl tries the direct write first
+   and only then sets `Ftst`. While `Ftst` is 1 macOS stops managing the temperature, so it is set
+   back to 0 whenever the fans are handed back, including on stop, exit and sleep.
 
 ### Keeping the footprint small
 
@@ -199,4 +206,5 @@ Resident memory is about 3 MB.
 - A hand-written curve is not smarter than the built-in control, which sees more sensors and
   reacts faster. fanctl is for preferences: quieter, cooler, or steady airflow.
 - Intel Macs are not supported; on Macs without fans the daemon exits.
-- Tested on a 14-inch MacBook Pro (M3 Pro, Mac15,6, 2 fans, 2317–6800 rpm) with macOS 14.4.
+- Tested on a 14-inch MacBook Pro (M3 Pro, Mac15,6, 2 fans, 2317–6800 rpm) with macOS 14.4. The `Ftst`
+  path for MacBooks that lock fan control follows published research and is not yet tested on such a Mac.

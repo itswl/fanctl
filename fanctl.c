@@ -49,7 +49,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 
-#define FANCTL_VERSION "1.0.1"
+#define FANCTL_VERSION "1.0.2"
 #define CONF_PATH      "/usr/local/etc/fancontrol.conf"
 #define PRESET_DIR     "/usr/local/share/fanctl/presets"
 #define LOCK_PATH      "/var/run/fanctl.lock"
@@ -408,12 +408,29 @@ static int fan_float(int idx, const char *suffix, float *v)
     return smc_read_float(k, v);
 }
 
+/* The mode key is F<i>Md, or F<i>md on newer chips; looked up once per fan. */
+static char mode_keys[MAX_FANS][8];
+
+static const char *mode_key(int idx)
+{
+    if (idx < 0 || idx >= MAX_FANS) return NULL;
+    char *k = mode_keys[idx];
+    if (!k[0]) {
+        SMCKeyInfoData info;
+        snprintf(k, 8, "F%dMd", idx);
+        if (smc_keyinfo(fourcc(k), &info) != 0) {
+            snprintf(k, 8, "F%dmd", idx);
+            if (smc_keyinfo(fourcc(k), &info) != 0) strcpy(k, "-");
+        }
+    }
+    return k[0] == '-' ? NULL : k;
+}
+
 static int fan_mode(int idx)
 {
-    char k[8];
+    const char *k = mode_key(idx);
     int m;
-    snprintf(k, sizeof k, "F%dMd", idx);
-    return smc_read_u8(k, &m) == 0 ? m : -1;
+    return k && smc_read_u8(k, &m) == 0 ? m : -1;
 }
 
 static int read_fan(int idx, FanState *f)
@@ -424,13 +441,45 @@ static int read_fan(int idx, FanState *f)
     return 0;
 }
 
-/* Mode key: 1 = manual, 0 = SMC. It is a one-byte ui8; written as a float, 1.0 would put
- * 0x00 in the first byte and the SMC would never hand the fan over. */
+/* Mode: 1 = manual, 0 = SMC, 3 = macOS is managing the temperature and refuses manual. It is a
+ * one-byte ui8; written as a float, 1.0 would put 0x00 in the first byte. */
 static int set_fan_mode(int idx, unsigned char manual)
 {
-    char k[8];
-    snprintf(k, sizeof k, "F%dMd", idx);
-    return smc_write_bytes(k, &manual, 1);
+    const char *k = mode_key(idx);
+    return k ? smc_write_bytes(k, &manual, 1) : -1;
+}
+
+/* Ftst is one switch for all fans. Some MacBooks refuse manual mode (mode 3) until it is 1, and
+ * while it is 1 macOS stops managing the temperature, so it goes back to 0 whenever the fans are
+ * handed back. Most Macs do not have it and take manual mode directly. */
+static int has_ftst(void)
+{
+    static int have = -1;
+    SMCKeyInfoData info;
+    if (have < 0) have = smc_keyinfo(fourcc("Ftst"), &info) == 0;
+    return have;
+}
+
+static void ftst_off(void)
+{
+    int v;
+    unsigned char off = 0;
+    if (has_ftst() && smc_read_u8("Ftst", &v) == 0 && v == 1) smc_write_bytes("Ftst", &off, 1);
+}
+
+static int take_manual(int idx)
+{
+    if (set_fan_mode(idx, 1) == 0) return 0;
+    if (!has_ftst()) return -1;
+    unsigned char on = 1;
+    if (smc_write_bytes("Ftst", &on, 1) != 0) return -1;
+    usleep(500000);
+    for (int i = 0; i < 100; i++) {                 /* up to ~10 s; usually 4-6 s */
+        if (set_fan_mode(idx, 1) == 0) return 0;
+        usleep(100000);
+    }
+    ftst_off();                                     /* never leave macOS sidelined for nothing */
+    return -1;
 }
 
 /* A target written without manual mode is silently dropped (and without root the SMC also
@@ -438,7 +487,7 @@ static int set_fan_mode(int idx, unsigned char manual)
 static int set_fan(int idx, float rpm)
 {
     char k[8];
-    if (set_fan_mode(idx, 1) != 0) return -1;
+    if (take_manual(idx) != 0) return -1;
     usleep(20000);
     snprintf(k, sizeof k, "F%dTg", idx);
     if (smc_write_float(k, rpm) != 0) return -1;
@@ -460,6 +509,7 @@ static int restore_auto(void)
         smc_write_float(k, 0.0f);       /* clear the target so the fan may stop */
         set_fan_mode(i, 0);
     }
+    ftst_off();
     int still = 0;
     for (int tries = 0; tries < 10; tries++) {
         usleep(100000);
@@ -499,8 +549,8 @@ static int load_config(const char *path, Config *out)
     c.confirm_up = 5;
     c.confirm_down = 20;
     c.guard_on = 1;
-    c.guard_start = 90.0;
-    c.guard_full = 100.0;
+    c.guard_start = 95.0;
+    c.guard_full = 108.0;
 
     FILE *fp = fopen(path, "r");
     if (!fp) { logmsg("cannot open %s: %s", path, strerror(errno)); return -1; }
@@ -704,7 +754,7 @@ static int cmd_status(void)
     for (int i = 0; i < n; i++) {
         FanState f;
         if (read_fan(i, &f) != 0) { printf("  fan%d  unreadable\n", i); continue; }
-        const char *m = f.mode == 1 ? "manual" : f.mode == 0 ? (f.target < 1 ? "auto (stopped)" : "auto") : "?";
+        const char *m = f.mode == 1 ? "manual" : (f.mode == 0 || f.mode == 3) ? (f.target < 1 ? "auto (stopped)" : "auto") : "?";
         printf("  fan%d  %4.0f rpm  target %4.0f  range %.0f-%.0f  %s\n", i, f.actual, f.target, f.min, f.max, m);
     }
     char preset[64];
@@ -773,6 +823,7 @@ static int cmd_set(int argc, char **argv)
         if (set_fan(i, v) != 0) { fprintf(stderr, "fan%d: writing %.0f rpm failed\n", i, v); bad++; }
         else printf("fan%d -> %.0f rpm\n", i, v);
     }
+    if (bad) { restore_auto(); fprintf(stderr, "fanctl: the fans are back with macOS\n"); }
     return bad ? 1 : 0;
 }
 
@@ -1084,6 +1135,16 @@ static void wait_tick(int sec)
 #define RAMP_UP   0.02
 #define RAMP_DOWN 0.005
 
+/* Smoothed CPU temperature at which the fans go straight back to macOS (Apple Silicon hot spots
+ * sit at 95-103 °C under ordinary sustained load; the junction limit is about 110 °C), and how
+ * long fanctl then stays out. Overridable at build time for tests only. */
+#ifndef HOT_LIMIT
+#define HOT_LIMIT 110.0
+#endif
+#ifndef COOLDOWN
+#define COOLDOWN 120
+#endif
+
 static double mono_now(void)
 {
     struct timespec ts;
@@ -1140,7 +1201,9 @@ static int cmd_run(int argc, char **argv)
     double lvl[MAX_FANS];               /* the speed fanctl holds each fan at (rpm) */
     int rise_n[MAX_FANS], fall_n[MAX_FANS];
     int moving[MAX_FANS];               /* +1 ramping up, -1 ramping down, 0 holding */
-    int panic = 0;
+    int cpu_bad = 0;                    /* consecutive checks without a CPU temperature */
+    int take_fail = 0;                  /* consecutive checks where no fan could be taken over */
+    time_t cooldown = 0;                /* no takeover before this time */
     double last_tick = 0;
     time_t last_write = 0, last_fail_log = 0;
 
@@ -1187,13 +1250,16 @@ static int cmd_run(int argc, char **argv)
         if (!manual) {
             /* One high reading is not enough: take over only after confirm_up checks in a row at
              * or above auto_below. Meanwhile the SMC keeps cooling as usual. */
-            up_n = t >= cfg.auto_below ? up_n + 1 : 0;
+            up_n = t >= cfg.auto_below && time(NULL) >= cooldown ? up_n + 1 : 0;
             if (up_n < cfg.confirm_up) {
                 int s = up_n > 0 ? cfg.interval : auto_sleep(&cfg, t);
                 if (dry && verbose) {
                     if (up_n > 0)
                         printf("[dry] PMU %.1f°C >= %.0f°C, check %d of %d before taking over\n",
                                t, cfg.auto_below, up_n, cfg.confirm_up);
+                    else if (time(NULL) < cooldown)
+                        printf("[dry] PMU %.1f°C, SMC in charge, staying out for another %lds\n",
+                               t, (long)(cooldown - time(NULL)));
                     else
                         printf("[dry] PMU %.1f°C, SMC in charge (takes over at %.0f°C), next check in %ds\n",
                                t, cfg.auto_below, s);
@@ -1207,7 +1273,7 @@ static int cmd_run(int argc, char **argv)
             up_n = down_n = 0;
             cpu_ema = -1;
             last_tick = 0;
-            panic = 0;
+            cpu_bad = 0;
             for (int i = 0; i < n; i++) {
                 float ac;
                 if (fan_float(i, "Ac", &ac) != 0) ac = rmin[i];
@@ -1239,17 +1305,25 @@ static int cmd_run(int argc, char **argv)
 
         /* The CPU temperature is spiky (the maximum jumps between 65 and 80 °C at idle), so the
          * guard works on an average with a 10 s time constant. */
-        double cpu = cfg.guard_on ? read_cpu_temp(k % GPU_EVERY == 0) : -1;
+        double cpu = read_cpu_temp(k % GPU_EVERY == 0);
         if (cpu > 0) cpu_ema = cpu_ema < 0 ? cpu : cpu_ema + (1 - exp(-dt / 10.0)) * (cpu - cpu_ema);
+        cpu_bad = cpu > 0 ? 0 : cpu_bad + 1;
+
+        /* The two exceptions to confirming hand the fans straight back to macOS and keep fanctl
+         * out for two minutes: the CPU at its limit (macOS then also throttles, and on Macs that
+         * needed Ftst its own temperature management resumes), and CPU sensors gone blind. */
+        if (cpu_ema >= HOT_LIMIT || cpu_bad >= 3) {
+            manual = fans_ours = 0;
+            up_n = down_n = 0;
+            int still = dry ? 0 : restore_auto();
+            cooldown = time(NULL) + COOLDOWN;
+            if (cpu_bad >= 3) logmsg("cannot read the CPU temperature -> fans back to SMC%s", still ? " (some still read as manual)" : "");
+            else              logmsg("CPU %.1f°C -> fans back to SMC%s", cpu_ema, still ? " (some still read as manual)" : "");
+            wait_tick(cfg.interval);
+            continue;
+        }
         double cv = curve_value(&cfg, t);
         double gp = guard_pct(&cfg, cpu_ema);
-
-        /* The one exception to confirming: a CPU at guard_full gets full speed at once. */
-        int hot = cfg.guard_on && cpu_ema >= cfg.guard_full;
-        if (hot != panic) {
-            panic = hot;
-            logmsg(hot ? "CPU %.1f°C -> fans to full speed" : "CPU %.1f°C, back to the curve", cpu_ema);
-        }
 
         /* Each fan's level moves only after the change has been seen on several checks in a row
          * (confirm_up to go up, confirm_down to go down), then ramps: up by 2 % of the range per
@@ -1262,10 +1336,7 @@ static int cmd_run(int argc, char **argv)
                 double g = rmin[i] + gp / 100.0 * range;
                 if (g > want) want = g;
             }
-            if (panic) {
-                lvl[i] = rmax[i];
-                rise_n[i] = fall_n[i] = moving[i] = 0;
-            } else if (want > lvl[i] + 100) {
+            if (want > lvl[i] + 100) {
                 fall_n[i] = 0;
                 if (moving[i] < 0) moving[i] = 0;
                 if (moving[i] == 0 && ++rise_n[i] >= cfg.confirm_up) { moving[i] = 1; started = 1; }
@@ -1300,9 +1371,10 @@ static int cmd_run(int argc, char **argv)
                 len += snprintf(shown + len, sizeof shown - len, " fan%d %.0f%s", i, lvl[i],
                                 moving[i] > 0 ? "+" : moving[i] < 0 ? "-" : "");
             if (dry || !can_write) continue;
-            /* Write only when the level moved by more than 100 rpm, or the SMC took the fan back
-             * (mode 0), or someone else changed the target. Constant rewriting gets throttled. */
-            int need = fset[i] < 0 || fabs(lvl[i] - fset[i]) > 100 || fan_mode(i) == 0;
+            /* Write only when the level moved by more than 100 rpm, or macOS took the fan back
+             * (mode 0 or 3), or someone else changed the target. Constant rewriting is throttled. */
+            int need = fset[i] < 0 || fabs(lvl[i] - fset[i]) > 100;
+            if (!need) { int m = fan_mode(i); need = m >= 0 && m != 1; }
             if (!need && verify) {
                 float tg;
                 if (fan_float(i, "Tg", &tg) == 0 && fabsf(tg - fset[i]) > 1) need = 1;
@@ -1313,6 +1385,17 @@ static int cmd_run(int argc, char **argv)
             wrote = 1;
         }
         if (wrote) last_write = time(NULL);
+        /* A Mac that never lets fanctl take a fan over: stop trying for a while. */
+        take_fail = bad == n ? take_fail + 1 : 0;
+        if (take_fail >= 3 && !dry) {
+            manual = fans_ours = 0;
+            up_n = down_n = take_fail = 0;
+            restore_auto();
+            cooldown = time(NULL) + 600;
+            logmsg("cannot take over the fans on this Mac -> left to macOS, next try in 10 minutes");
+            wait_tick(cfg.interval);
+            continue;
+        }
         if (dry && verbose) {
             printf("[dry] PMU %.1f°C  CPU %.1f°C (smoothed) ->%s rpm", t, cpu_ema, shown);
             if (down_n > 0) printf("  (hand-back check %d of %d)", down_n, cfg.confirm_down);
