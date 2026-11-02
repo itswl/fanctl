@@ -1,9 +1,8 @@
 class Fanctl < Formula
   desc "Temperature-based fan control for Apple Silicon Macs"
   homepage "https://github.com/itswl/fanctl"
-  url "https://github.com/itswl/fanctl/archive/refs/tags/v1.0.3.tar.gz"
-  sha256 "80e83440042f25e5144562febb872e5fa55c5fbbea9cf77731e3f3ebe63a1a29"
-  revision 1
+  url "https://github.com/itswl/fanctl/archive/refs/tags/v1.0.4.tar.gz"
+  sha256 "da4c3cb705addc90a452ec80e1edfef33cfb4132438e995af6a9c74d682bcbdd"
 
   depends_on arch: :arm64
   depends_on macos: :sonoma
