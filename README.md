@@ -24,7 +24,7 @@ It asks for your password, installs `fanctl`, the presets, the config (the **bal
 and a LaunchDaemon, starts it and prints the status. Run the same command again to upgrade; your
 config and autostart setting are kept. If you'd rather read it first, download `install.sh` and run `sh install.sh`.
 
-To start with another preset (`quiet`, `balanced`, `cool` or `lap`), add `-s -- --preset NAME`;
+To start with another preset (`quiet`, `balanced`, `cool`, `lap` or `full`), add `-s -- --preset NAME`;
 the old config is kept as `fancontrol.conf.bak`:
 
 ```sh
@@ -70,6 +70,7 @@ brew uninstall fanctl
 | `quiet` | 62 °C | Less noise. Below 62 °C the fans are left to macOS; long full loads run a few degrees warmer. |
 | `cool` | 48 °C | Long builds, renders, model runs. Audible under medium load. |
 | `lap` | 40 °C | On your lap: the fans never stop, which keeps the bottom of the case cool. Faint noise at idle. |
+| `full` | always | Every fan at full speed: burn-in, benchmarks, getting rid of heat fast. Loud. |
 
 `sudo fanctl preset quiet` switches presets; it takes effect at once, and a config you edited by
 hand is saved as `fancontrol.conf.bak` first. `fanctl preset` lists them and marks the active one.
@@ -92,16 +93,21 @@ fanctl run --dry-run --verbose   # what the daemon would do, without touching th
 
 ### Manual control
 
-The running daemon overrides manual settings, so stop it first and start it again when you are
-done:
+`fanctl set` outranks the preset and every other rule, for 10 minutes unless you say otherwise;
+then the preset carries on from the speed the fans are at:
 
 ```sh
-sudo fanctl stop          # stop the daemon (the fans go back to macOS)
-sudo fanctl set 3000      # pin every fan to 3000 rpm
-sudo fanctl set 1 2600    # or just fan 1
-sudo fanctl auto          # hand the fans back to macOS
-sudo fanctl start         # back to the curve
+sudo fanctl set 3000              # every fan at 3000 rpm for 10 minutes
+sudo fanctl set 3000 30m          # for 30 minutes (s, m, h)
+sudo fanctl set 3000 always       # until you end it
+sudo fanctl set 1 2600 1h         # fan 1 only; while it lasts the other fans are left to macOS
+sudo fanctl set off               # end it now
 ```
+
+`fanctl status` shows what is set and until when. A manual setting survives a restart of fanctl, and
+`always` survives a reboot. The only thing that ends it early is the CPU reaching its 110 °C limit:
+then the fans go back to macOS. If the daemon is not running, `set` sets the fans directly and
+nothing ends it on time.
 
 ## Configuration
 

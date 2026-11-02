@@ -23,7 +23,7 @@ wget -qO- https://github.com/itswl/fanctl/releases/latest/download/install.sh | 
 `fanctl`、预设、配置（**balanced** 预设）和 LaunchDaemon，启动并打印状态。再跑一次同样的命令
 就是升级，已有的配置和开机自启设置都会保留。想先看看脚本的话，下载 `install.sh` 再 `sh install.sh`。
 
-想一开始就用别的预设（`quiet`、`balanced`、`cool`、`lap`），加上 `-s -- --preset 名字`，
+想一开始就用别的预设（`quiet`、`balanced`、`cool`、`lap`、`full`），加上 `-s -- --preset 名字`，
 旧配置会保存为 `fancontrol.conf.bak`：
 
 ```sh
@@ -69,6 +69,7 @@ brew uninstall fanctl
 | `quiet` | 62 °C | 更安静。62 °C 以下风扇全交给 macOS；长时间满载会高几度。 |
 | `cool` | 48 °C | 长时间编译、渲染、跑模型。中等负载就听得到风扇。 |
 | `lap` | 40 °C | 放腿上用：风扇一直转，压住底壳温度。待机也有轻微风噪。 |
+| `full` | 一直 | 所有风扇全速：烤机、跑分、快速散热。很吵。 |
 
 `sudo fanctl preset quiet` 切换预设，立刻生效；如果配置是你手改过的，会先存成
 `fancontrol.conf.bak`。`fanctl preset` 列出所有预设，并标出当前用的是哪个。
@@ -91,15 +92,19 @@ fanctl run --dry-run --verbose   # 看守护进程会怎么做，不碰风扇
 
 ### 手动控制
 
-守护进程在跑的话会覆盖手动设置，所以先停掉它，用完再启动：
+`fanctl set` 的优先级高于预设和其他所有规则，默认持续 10 分钟，之后预设从风扇当前的转速接着管：
 
 ```sh
-sudo fanctl stop          # 停掉守护进程（风扇先交回 macOS）
-sudo fanctl set 3000      # 所有风扇锁 3000 rpm
-sudo fanctl set 1 2600    # 或者只调 1 号风扇
-sudo fanctl auto          # 风扇交回 macOS
-sudo fanctl start         # 恢复按曲线控制
+sudo fanctl set 3000              # 所有风扇 3000 rpm，持续 10 分钟
+sudo fanctl set 3000 30m          # 持续 30 分钟（单位 s、m、h）
+sudo fanctl set 3000 always       # 一直保持，直到你结束它
+sudo fanctl set 1 2600 1h         # 只设 1 号风扇；持续期间其他风扇交给 macOS
+sudo fanctl set off               # 马上结束
 ```
+
+`fanctl status` 会显示当前手动设置和到期时间。手动设置在 fanctl 重启后仍然有效，`always` 重启电脑也
+保留。唯一会提前结束它的是 CPU 到 110 °C 上限：这时风扇交回 macOS。守护进程没在跑的话，`set` 直接
+设定风扇，到点也不会自动结束。
 
 ## 配置
 

@@ -7,8 +7,9 @@
  *   fanctl preset [NAME]           list the presets / switch to one              (root)
  *   fanctl reload                  check the config and make the daemon reload it (root)
  *   fanctl temp                    the PMU temperature the curve uses
- *   fanctl set <rpm>               pin every fan to <rpm>                  (root)
- *   fanctl set <fan#> <rpm>        pin one fan                             (root)
+ *   fanctl set [<fan#>] <rpm> [90s|10m|2h|always]
+ *                                  manual speed, above every other rule; 10 minutes by default (root)
+ *   fanctl set off                 end it, back to the preset              (root)
  *   fanctl auto                    hand the fans back to the SMC           (root)
  *   fanctl check [--config FILE]   validate a config file
  *   fanctl run [--config FILE] [--dry-run] [--verbose]
@@ -49,7 +50,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 
-#define FANCTL_VERSION "1.0.3"
+#define FANCTL_VERSION "1.0.4"
 
 /* Install locations. The Homebrew formula builds with its own (see Formula/fanctl.rb). */
 #ifndef CONF_PATH
@@ -752,6 +753,90 @@ static int daemon_pid(void)
     return pid;
 }
 
+/* ------------------------------------------------------------------ manual override */
+
+/* `fanctl set` stores the manual speeds here and signals the daemon, which applies them before
+ * every other rule until they run out (until = 0: always) and then goes back to the preset. */
+#define OVERRIDE_PATH CONF_PATH ".override"
+
+typedef struct { time_t until; float rpm[MAX_FANS]; int pinned; } Override;    /* rpm 0 = not set */
+
+/* Reads the override; 0 when there is none or it has run out. */
+static int override_read(Override *o)
+{
+    memset(o, 0, sizeof *o);
+    FILE *fp = fopen(OVERRIDE_PATH, "r");
+    if (!fp) return 0;
+    long long until = 0;
+    char w[32];
+    if (fscanf(fp, "%lld", &until) == 1)
+        for (int i = 0; i < MAX_FANS && fscanf(fp, "%31s", w) == 1; i++) {
+            o->rpm[i] = strcmp(w, "-") ? strtof(w, NULL) : 0;
+            if (o->rpm[i] > 0) o->pinned++;
+        }
+    fclose(fp);
+    o->until = (time_t)until;
+    if (!o->pinned || (o->until && time(NULL) >= o->until)) { memset(o, 0, sizeof *o); return 0; }
+    return 1;
+}
+
+static int override_write(const Override *o, int n)
+{
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof tmp, "%s.tmp", OVERRIDE_PATH);
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) return -1;
+    fprintf(fp, "%lld", (long long)o->until);
+    for (int i = 0; i < n; i++) {
+        if (o->rpm[i] > 0) fprintf(fp, " %.0f", o->rpm[i]);
+        else               fprintf(fp, " -");
+    }
+    fputc('\n', fp);
+    int ok = fclose(fp) == 0;
+    if (!ok || chmod(tmp, 0644) != 0 || rename(tmp, OVERRIDE_PATH) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
+static void override_describe(const Override *o, int n, char *buf, size_t sz)
+{
+    size_t len = 0;
+    buf[0] = 0;
+    for (int i = 0; i < n && len < sz; i++)
+        if (o->rpm[i] > 0) len += snprintf(buf + len, sz - len, "fan%d %.0f rpm, ", i, o->rpm[i]);
+    if (len >= sz) return;
+    if (o->until) {
+        struct tm tm;
+        char hm[16];
+        localtime_r(&o->until, &tm);
+        strftime(hm, sizeof hm, "%H:%M", &tm);
+        snprintf(buf + len, sz - len, "until %s", hm);
+    } else {
+        snprintf(buf + len, sz - len, "until you end it");
+    }
+}
+
+/* "90s", "10m", "2h" or "always" (0); -1 if it is none of these. */
+static long parse_duration(const char *s)
+{
+    if (!strcmp(s, "always")) return 0;
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || v <= 0) return -1;
+    if (!strcmp(end, "s")) return (long)v;
+    if (!strcmp(end, "m")) return (long)(v * 60);
+    if (!strcmp(end, "h")) return (long)(v * 3600);
+    return -1;
+}
+
+/* One fan back to the SMC; Ftst is left alone because other fans may still need it. */
+static void fan_release(int idx)
+{
+    char k[8];
+    snprintf(k, sizeof k, "F%dTg", idx);
+    smc_write_float(k, 0.0f);
+    set_fan_mode(idx, 0);
+}
+
 /* ------------------------------------------------------------------ commands */
 
 static int autostart_state(void);
@@ -774,6 +859,12 @@ static int cmd_status(void)
     char preset[64];
     preset_of(CONF_PATH, preset, sizeof preset);
     printf("config  %s (preset: %s)\n", CONF_PATH, preset);
+    Override o;
+    if (override_read(&o)) {
+        char od[160];
+        override_describe(&o, n, od, sizeof od);
+        printf("manual  %s, then back to the preset\n", od);
+    }
     int pid = daemon_pid();
     if (pid > 0)       printf("daemon  running, pid %d\n", pid);
     else if (pid < 0)  printf("daemon  running\n");
@@ -799,53 +890,90 @@ static int parse_num(const char *s, double *v)
     return (end != s && *end == 0 && errno == 0) ? 0 : -1;
 }
 
-static void warn_daemon(void)
+static int launchctl(const char *a, const char *b, const char *c);
+
+static int set_off(void)
 {
-    if (daemon_pid())
-        fprintf(stderr, "note: the fanctl daemon is running and will undo this within seconds; "
-                        "stop it first: sudo fanctl stop\n");
+    if (geteuid() != 0) { fprintf(stderr, "fanctl: set off needs root: sudo fanctl set off\n"); return 1; }
+    int had = access(OVERRIDE_PATH, F_OK) == 0;
+    unlink(OVERRIDE_PATH);
+    char preset[64];
+    preset_of(CONF_PATH, preset, sizeof preset);
+    if (daemon_pid() != 0) {
+        launchctl("kill", "HUP", "system/" LABEL);
+        printf("%s, back to the %s preset\n", had ? "manual setting ended" : "no manual setting was active", preset);
+        return 0;
+    }
+    if (smc_open() != 0) return 1;
+    int still = restore_auto();
+    printf("manual setting ended; fanctl is not running, so the fans are back with macOS\n");
+    return still ? 1 : 0;
 }
 
 static int cmd_set(int argc, char **argv)
 {
+    if (argc == 1 && !strcmp(argv[0], "off")) return set_off();
+    long dur = 600;                                 /* 10 minutes unless told otherwise */
+    if (argc >= 2 && parse_duration(argv[argc - 1]) >= 0) dur = parse_duration(argv[--argc]);
     double idx_d = -1, rpm = 0;
     if (!(argc == 1 && parse_num(argv[0], &rpm) == 0) &&
         !(argc == 2 && parse_num(argv[0], &idx_d) == 0 && parse_num(argv[1], &rpm) == 0)) {
-        fprintf(stderr, "usage: fanctl set <rpm> | fanctl set <fan#> <rpm>\n");
+        fprintf(stderr, "usage: fanctl set [<fan#>] <rpm> [90s|10m|2h|always] | fanctl set off\n");
         return 2;
     }
-    if (rpm <= 0) { fprintf(stderr, "fanctl: rpm must be > 0 (use 'fanctl auto' to hand back)\n"); return 2; }
+    if (rpm <= 0) { fprintf(stderr, "fanctl: rpm must be > 0 (use 'fanctl set off' to end a manual setting)\n"); return 2; }
     if (smc_open() != 0) return 1;
     int n = fan_count();
+    if (n > MAX_FANS) n = MAX_FANS;
     int idx = -1;
     if (argc == 2) {
         if (idx_d < 0 || idx_d >= n || idx_d != floor(idx_d)) {
-            fprintf(stderr, "fanctl: there is no fan%s (this Mac has %d, numbered from 0)\n", argv[0], n);
+            fprintf(stderr, "fanctl: there is no fan%s (this Mac has %d, numbered from 0; durations need a unit: 30m)\n", argv[0], n);
             return 2;
         }
         idx = (int)idx_d;
     }
-    if (geteuid() != 0) { fprintf(stderr, "fanctl: writing to the SMC needs root: sudo fanctl set ...\n"); return 1; }
-    warn_daemon();
+    if (geteuid() != 0) { fprintf(stderr, "fanctl: set needs root: sudo fanctl set ...\n"); return 1; }
 
-    int bad = 0;
+    Override o;
+    if (idx < 0 || !override_read(&o)) memset(&o, 0, sizeof o);   /* one fan: keep the others already set */
+    o.until = dur ? time(NULL) + dur : 0;
     for (int i = 0; i < n; i++) {
         if (idx >= 0 && i != idx) continue;
         FanState f;
-        if (read_fan(i, &f) != 0) { fprintf(stderr, "fan%d: cannot read\n", i); bad++; continue; }
-        float v = rpm < f.min ? f.min : (rpm > f.max ? f.max : (float)rpm);
-        if (set_fan(i, v) != 0) { fprintf(stderr, "fan%d: writing %.0f rpm failed\n", i, v); bad++; }
-        else printf("fan%d -> %.0f rpm\n", i, v);
+        if (read_fan(i, &f) != 0) { fprintf(stderr, "fan%d: cannot read\n", i); return 1; }
+        o.rpm[i] = rpm < f.min ? f.min : (rpm > f.max ? f.max : (float)rpm);
     }
-    if (bad) { restore_auto(); fprintf(stderr, "fanctl: the fans are back with macOS\n"); }
-    return bad ? 1 : 0;
+    o.pinned = 0;
+    for (int i = 0; i < n; i++) if (o.rpm[i] > 0) o.pinned++;
+    if (override_write(&o, n) != 0) { fprintf(stderr, "fanctl: cannot write %s: %s\n", OVERRIDE_PATH, strerror(errno)); return 1; }
+    char od[160], preset[64];
+    override_describe(&o, n, od, sizeof od);
+    preset_of(CONF_PATH, preset, sizeof preset);
+    if (daemon_pid() != 0) {
+        if (launchctl("kill", "HUP", "system/" LABEL) != 0) { fprintf(stderr, "fanctl: could not signal the daemon\n"); return 1; }
+        printf("manual: %s, then back to the %s preset\n", od, preset);
+        return 0;
+    }
+    /* No daemon: set the fans now. Nothing ends this on its own until the daemon runs again. */
+    int bad = 0;
+    for (int i = 0; i < n; i++)
+        if (o.rpm[i] > 0 && set_fan(i, o.rpm[i]) != 0) { fprintf(stderr, "fan%d: writing %.0f rpm failed\n", i, o.rpm[i]); bad++; }
+    if (bad) { restore_auto(); unlink(OVERRIDE_PATH); fprintf(stderr, "fanctl: the fans are back with macOS\n"); return 1; }
+    printf("manual: %s\nfanctl is not running, so nothing ends this on time; end it with: sudo fanctl set off\n", od);
+    return 0;
 }
 
 static int cmd_auto(void)
 {
     if (geteuid() != 0) { fprintf(stderr, "fanctl: writing to the SMC needs root: sudo fanctl auto\n"); return 1; }
     if (smc_open() != 0) return 1;
-    warn_daemon();
+    unlink(OVERRIDE_PATH);                          /* any manual setting ends here too */
+    if (daemon_pid() != 0) {
+        launchctl("kill", "HUP", "system/" LABEL);
+        printf("fanctl is running and follows its preset; to leave the fans to macOS: sudo fanctl stop\n");
+        return 0;
+    }
     int still = restore_auto();
     int n = fan_count();
     for (int i = 0; i < n; i++) {
@@ -1040,8 +1168,11 @@ static int cmd_preset(int argc, char **argv)
     if (!strcmp(active, "custom") && copy_file(CONF_PATH, CONF_PATH ".bak") == 0)
         printf("your edited config was saved as %s.bak\n", CONF_PATH);
     if (copy_file(path, CONF_PATH) != 0) { fprintf(stderr, "fanctl: cannot write %s: %s\n", CONF_PATH, strerror(errno)); return 1; }
-    if (daemon_pid() != 0 && launchctl("kill", "HUP", "system/" LABEL) == 0)
-        printf("preset %s is active\n", name);
+    Override o;
+    if (daemon_pid() != 0 && launchctl("kill", "HUP", "system/" LABEL) == 0) {
+        if (override_read(&o)) printf("preset %s is set; it takes over when the manual setting ends\n", name);
+        else                   printf("preset %s is active\n", name);
+    }
     else
         printf("preset %s is set; fanctl is not running (sudo fanctl start)\n", name);
     return 0;
@@ -1220,12 +1351,20 @@ static int cmd_run(int argc, char **argv)
     time_t cooldown = 0;                /* no takeover before this time */
     double last_tick = 0;
     time_t last_write = 0, last_fail_log = 0;
+    char od[160];
+
+    /* A manual setting from `fanctl set` outranks everything below; it survives restarts. */
+    Override ov;
+    int ov_on = override_read(&ov), ov_check = 0;
+    if (ov_on) { override_describe(&ov, n, od, sizeof od); logmsg("manual setting: %s", od); }
+    else if (!dry) unlink(OVERRIDE_PATH);          /* one that ran out while fanctl was off */
 
     while (!stop_sig) {
         if (power_event) {              /* slept or woke: the fans are the SMC's again, start over */
             power_event = 0;
             manual = 0;
             up_n = down_n = 0;
+            for (int i = 0; i < n; i++) fset[i] = -1;
         }
         if (reload_req) {               /* sudo launchctl kill HUP system/local.fancontrol */
             reload_req = 0;
@@ -1237,6 +1376,100 @@ static int cmd_run(int argc, char **argv)
             } else {
                 logmsg("the new config is invalid, keeping the old one");
             }
+            ov_check = 1;               /* `fanctl set` signals the same way */
+        }
+
+        if (ov_check || (ov_on && ov.until && time(NULL) >= ov.until)) {
+            ov_check = 0;
+            Override no;
+            int now_on = override_read(&no);
+            if (now_on && (!ov_on || memcmp(&no, &ov, sizeof no))) {
+                /* Started or changed: the preset steps aside; fans you did not set go to macOS. */
+                for (int i = 0; i < n; i++) {
+                    if (no.rpm[i] <= 0 && fans_ours && !dry) fan_release(i);
+                    fset[i] = -1;
+                }
+                ov = no;
+                ov_on = 1;
+                manual = 0;
+                up_n = down_n = 0;
+                override_describe(&ov, n, od, sizeof od);
+                logmsg("manual setting: %s", od);
+            } else if (!now_on && ov_on) {
+                /* Ended: the preset carries on from the speed the fans are at, no sudden drop. */
+                ov_on = 0;
+                if (!dry) unlink(OVERRIDE_PATH);
+                up_n = down_n = cpu_bad = 0;
+                if (t >= cfg.auto_below - cfg.auto_hyst) {
+                    manual = fans_ours = 1;
+                    k = 0;
+                    cpu_ema = -1;
+                    last_tick = 0;
+                    for (int i = 0; i < n; i++) {
+                        float ac;
+                        if (fan_float(i, "Ac", &ac) != 0) ac = rmin[i];
+                        lvl[i] = ac < rmin[i] ? rmin[i] : (ac > rmax[i] ? rmax[i] : ac);
+                        rise_n[i] = fall_n[i] = 0;
+                        moving[i] = 1;
+                        fset[i] = -1;
+                    }
+                } else {
+                    manual = fans_ours = 0;
+                    if (!dry) restore_auto();
+                }
+                logmsg("manual setting ended -> back to the preset");
+            }
+        }
+
+        if (ov_on) {
+            /* Nothing but the chip's own limit overrides a manual setting: the curve, the guard and
+             * the confirmations all wait. The PMU temperature is only kept fresh for the hand-over. */
+            if (k % 5 == 0) { double nt = read_temp(); if (nt > 0) t = nt; }
+            double now = mono_now();
+            double dt = last_tick > 0 ? now - last_tick : cfg.interval;
+            if (dt > 2.0 * cfg.interval) dt = 2.0 * cfg.interval;
+            last_tick = now;
+            double cpu = read_cpu_temp(k % GPU_EVERY == 0);
+            if (cpu > 0) cpu_ema = cpu_ema < 0 ? cpu : cpu_ema + (1 - exp(-dt / 10.0)) * (cpu - cpu_ema);
+            cpu_bad = cpu > 0 ? 0 : cpu_bad + 1;
+            if (cpu_ema >= HOT_LIMIT || cpu_bad >= 3) {
+                ov_on = 0;
+                if (!dry) unlink(OVERRIDE_PATH);
+                manual = fans_ours = 0;
+                up_n = down_n = 0;
+                int still = dry ? 0 : restore_auto();
+                cooldown = time(NULL) + COOLDOWN;
+                if (cpu_bad >= 3) logmsg("cannot read the CPU temperature -> manual setting ended, fans back to SMC%s", still ? " (some still read as manual)" : "");
+                else              logmsg("CPU %.1f°C -> manual setting ended, fans back to SMC%s", cpu_ema, still ? " (some still read as manual)" : "");
+                wait_tick(cfg.interval);
+                continue;
+            }
+            int bad = 0;
+            for (int i = 0; i < n && !dry; i++) {
+                if (ov.rpm[i] <= 0) continue;
+                float want = ov.rpm[i] < rmin[i] ? rmin[i] : (ov.rpm[i] > rmax[i] ? rmax[i] : ov.rpm[i]);
+                int need = fset[i] < 0 || fabsf(fset[i] - want) > 1;
+                if (!need) { int m = fan_mode(i); need = m >= 0 && m != 1; }
+                if (!need && k % TG_EVERY == 0) {
+                    float tg;
+                    if (fan_float(i, "Tg", &tg) == 0 && fabsf(tg - want) > 1) need = 1;
+                }
+                if (!need) continue;
+                if (set_fan(i, want) == 0) fset[i] = want;
+                else { fset[i] = -1; bad++; }
+            }
+            fans_ours = 1;
+            if (dry && verbose) {
+                override_describe(&ov, n, od, sizeof od);
+                printf("[dry] manual: %s  (PMU %.1f°C  CPU %.1f°C)\n", od, t, cpu_ema);
+            }
+            if (bad && time(NULL) - last_fail_log >= 60) {
+                logmsg("manual setting: writing failed for %d fan%s", bad, bad == 1 ? "" : "s");
+                last_fail_log = time(NULL);
+            }
+            k++;
+            wait_tick(cfg.interval);
+            continue;
         }
 
         /* The PMU temperature is read on every check while the SMC has the fans; while they are
@@ -1444,7 +1677,7 @@ static void usage(void)
         "  fanctl preset [NAME]\n"
         "  fanctl reload\n"
         "  fanctl temp\n"
-        "  fanctl set <rpm> | fanctl set <fan#> <rpm>\n"
+        "  fanctl set [<fan#>] <rpm> [90s|10m|2h|always] | fanctl set off\n"
         "  fanctl auto\n"
         "  fanctl check [--config FILE]\n"
         "  fanctl run [--config FILE] [--dry-run] [--verbose]\n"

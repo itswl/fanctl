@@ -3,7 +3,7 @@
 #
 #   curl -fsSL <latest release>/install.sh | sh
 #   curl -fsSL <latest release>/install.sh | sh -s -- --preset quiet
-#   sh install.sh [--preset quiet|balanced|cool|lap]
+#   sh install.sh [--preset quiet|balanced|cool|lap|full]
 #
 # The copy attached to each release carries the whole package (prebuilt binary, presets,
 # LaunchDaemon), so nothing is downloaded or compiled. It asks for your password, installs and
@@ -90,13 +90,13 @@ main() {
     while [ $# -gt 0 ]; do
         case $1 in
             --preset) [ $# -ge 2 ] || die "--preset needs a name"; PRESET=$2; shift 2 ;;
-            -h|--help) echo "usage: sh install.sh [--preset quiet|balanced|cool|lap]"; exit 0 ;;
+            -h|--help) echo "usage: sh install.sh [--preset quiet|balanced|cool|lap|full]"; exit 0 ;;
             *) die "unknown option: $1 (usage: sh install.sh [--preset NAME])" ;;
         esac
     done
     case $PRESET in
-        ""|quiet|balanced|cool|lap) ;;
-        *) die "unknown preset '$PRESET' (quiet, balanced, cool or lap)" ;;
+        ""|quiet|balanced|cool|lap|full) ;;
+        *) die "unknown preset '$PRESET' (quiet, balanced, cool, lap or full)" ;;
     esac
 
     # Work from / : the caller's directory may be unreadable for root (privacy-protected
